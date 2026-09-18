@@ -19,11 +19,19 @@ node wx_dm.mjs
 
 脚本要**一直挂着跑**才能收发消息，不是跑一次就退出的类型。
 
+启动后会额外起一个本地操控台服务，浏览器打开 `http://127.0.0.1:17894` 能实时看到收发的消息。
+
 > No extra environment variables needed. On first run it pops up / saves a QR code image (`qrcode.png`) — scan it with WeChat to bind a bot channel (this does **not** log into your main WeChat account). Once bound, the `bot_token` is persisted to `.wechat_state.json`, so you won't need to re-scan on restart unless that file is deleted or the token expires.
 >
 > The script needs to **keep running** to send/receive — it's not a run-once-and-exit tool.
+>
+> It also starts a local control-panel service — open `http://127.0.0.1:17894` in a browser to watch messages come in and go out in real time.
 
-## 对外接口：两个 jsonl 文件
+## 对外接口：两种，任选或都用
+
+设计取舍(为什么两种都留着、怎么避免重复发送)见 [`docs/adr/0001-realtime-transport.md`](docs/adr/0001-realtime-transport.md)。
+
+### 接口一：两个 jsonl 文件
 
 都在脚本所在目录下，每行一个 JSON 对象([JSON Lines](https://jsonlines.org/) 格式)。
 
@@ -59,7 +67,30 @@ node wx_dm.mjs
 | `reply_to` | 对应 `inbox.jsonl` 里那条消息的 `id`，本脚本靠这个查回该发给谁 |
 | `text` | 要发送的文本内容 |
 
-本脚本每秒轮询一次这个文件，发现新行就尝试发送。发送成功后会在自己内部状态里清掉对应的 pending 记录；如果 `reply_to` 对应不上(比如 id 写错、或者对应的消息已经被回复过一次)，会在控制台打印错误并跳过这一行，**不会重试，也不会报错给外部程序**——外部程序自己要检查发送有没有成功(简单办法：看脚本的 stdout 日志，或者在 `text` 里带一个自己能识别的标记做核对)。
+本脚本用 `fs.watch` 监听这个文件，一有变化就立刻检查新行并尝试发送(外加一个5秒兜底轮询，防止极少数环境下 `fs.watch` 漏事件)。发送成功后会在自己内部状态里清掉对应的 pending 记录；如果 `reply_to` 对应不上(比如 id 写错、或者对应的消息已经被回复过一次)，会在控制台打印错误并跳过这一行，**不会重试，也不会报错给外部程序**——外部程序自己要检查发送有没有成功(简单办法：看脚本的 stdout 日志，或者在 `text` 里带一个自己能识别的标记做核对)。
+
+### 接口二：本地 WebSocket(`ws://127.0.0.1:17894`)
+
+只绑定 `127.0.0.1`，跟文件接口一样默认信任"只有这台机器能访问"，不对外网开放。
+
+- **收到微信消息时**：除了写 `inbox.jsonl`，同时会把同样的内容广播给所有已连接的 WebSocket 客户端：
+  ```json
+  {"type": "inbox", "id": "550e8400-...", "ts": 1755230000000, "from_user_id": "...", "text": "你好"}
+  ```
+- **想发送回复时**：直接给这个 WebSocket 连接发：
+  ```json
+  {"reply_to": "550e8400-...", "text": "这是要发出去的回复内容"}
+  ```
+  本脚本会立刻发送(不用等文件轮询)，同时也会把这条补写进 `outbox.jsonl` 存档，避免文件那边重复处理。发送结果会通过同一条连接返回：
+  ```json
+  {"type": "outbox", "reply_to": "550e8400-...", "text": "...", "ts": 1755230001000}
+  ```
+  或者失败时：
+  ```json
+  {"type": "error", "message": "找不到 reply_to=... 对应的会话", "reply_to": "550e8400-..."}
+  ```
+- **支持同时连接多个客户端**，数量不限——想开几个 agent/操控台同时连都可以，本脚本保证多个客户端能同时正常收广播、同时发送不冲突。文件接口和 WebSocket 接口共用同一套发送逻辑和去重(`pending` 映射表)，哪边先发成功，另一边就会因为对应记录已经被清掉而自动跳过，不会重复发送。
+- **本地操控台**：浏览器直接打开 `http://127.0.0.1:17894`(同一个端口的 HTTP 服务)就能看到一个只读页面，实时显示收到/发出的消息，方便肉眼确认脚本在正常工作，不需要专门写一个 WebSocket 客户端去调试。
 
 ## 状态文件(外部程序不需要碰，了解即可)
 

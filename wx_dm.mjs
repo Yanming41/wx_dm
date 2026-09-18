@@ -1,11 +1,19 @@
-// wechat_bridge.mjs
+// wx_dm.mjs
 //
 // 纯传输层 —— 只负责微信 ClawBot(iLink协议) 的收发，不含任何起草/agent逻辑。
 // 不依赖 openclaw 核心包，只打验证过的官方接口 ilinkai.weixin.qq.com。
 //
-// 对外接口是两个文件（本目录下）：
-//   inbox.jsonl   本脚本写，外部agent读 —— 微信收到的每条消息一行JSON
-//   outbox.jsonl  外部agent写，本脚本读 —— agent想发出去的回复，一行JSON
+// 对外接口有两套，agent自己选一种或两种都用（设计取舍见 docs/adr/0001-realtime-transport.md）：
+//
+//   1) 文件接口（一直维护，无论有没有WebSocket客户端连着）：
+//      inbox.jsonl   本脚本写，外部agent读 —— 微信收到的每条消息一行JSON
+//      outbox.jsonl  外部agent写，本脚本读 —— agent想发出去的回复，一行JSON
+//
+//   2) WebSocket接口（ws://127.0.0.1:<WS_PORT>，仅本机可连）：
+//      本脚本收到微信消息 -> 立刻推送 {"type":"inbox",...} 给所有已连接客户端（同时也写inbox.jsonl）
+//      客户端发 {"reply_to":"...","text":"..."} -> 立刻发送回复（同时也补一行到outbox.jsonl存档）
+//      支持同时连接多个客户端（不限制数量，由部署者自己决定开几个agent）
+//      浏览器打开 http://127.0.0.1:<WS_PORT> 可以看到一个只读操控台，显示收发消息
 //
 // inbox 一行格式：  {"id":"<uuid>","ts":<毫秒时间戳>,"from_user_id":"...","text":"..."}
 // outbox 一行格式： {"reply_to":"<inbox里的id>","text":"..."}
@@ -13,19 +21,22 @@
 //    这些由本脚本内部维护的 pending 映射表负责补全。）
 //
 // 使用：
-//   node wechat_bridge.mjs
+//   node wx_dm.mjs
 //   首次运行会弹出二维码，微信扫码绑定 bot 频道（不是登录你的微信主账号）。
-//   之后常驻运行，两个内部循环并行：
-//     - 长轮询收微信消息 -> 写 inbox.jsonl
-//     - 轮询 outbox.jsonl 新增行 -> 发回微信
+//   之后常驻运行，几个内部循环/服务并行：
+//     - 长轮询收微信消息 -> 写 inbox.jsonl + WebSocket推送
+//     - fs.watch监听 outbox.jsonl 变化（外加保底轮询）-> 发回微信
+//     - 本地HTTP+WebSocket服务，提供操控台页面和实时收发接口
 
 import { readFile, writeFile, appendFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, watch as fsWatch } from "node:fs";
 import { exec } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import http from "node:http";
 import QRCode from "qrcode";
+import { WebSocketServer } from "ws";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -35,7 +46,13 @@ const QRCODE_FILE = path.join(__dirname, "qrcode.png");
 const INBOX_FILE = path.join(__dirname, "inbox.jsonl");
 const OUTBOX_FILE = path.join(__dirname, "outbox.jsonl");
 
-const OUTBOX_POLL_MS = 1000;
+// 保底轮询间隔——fs.watch在正常情况下会立刻触发，这个只是防止极端情况下(比如某些
+// 网络盘/容器环境fs.watch不可靠)漏掉变化事件的兜底，不是主要触发路径了。
+const OUTBOX_FALLBACK_POLL_MS = 5000;
+
+// 本机操控台+WebSocket端口。注意跟同项目下 chrome_lens_extension 的 lens_extension_bridge.mjs
+// (占用17893) 分开，避免冲突。只绑定127.0.0.1，不对外网开放。
+const WS_PORT = 17894;
 
 // ---------- iLink 基础工具 ----------
 
@@ -91,6 +108,113 @@ function openFile(filePath) {
       : `xdg-open "${filePath}"`;
   exec(cmd, (err) => {
     if (err) console.log(`没能自动打开图片，你自己去看一下：${filePath}`);
+  });
+}
+
+// ---------- 本地HTTP+WebSocket服务：操控台 + 实时收发 ----------
+//
+// wss.clients 本身就是个Set，装着所有当前连着的客户端，天然支持多个客户端同时连接，
+// 不用自己写连接数上限——想开几个agent/操控台，同时连就是了。
+
+let wss = null;
+
+function broadcast(event) {
+  if (!wss) return;
+  const payload = JSON.stringify(event);
+  for (const client of wss.clients) {
+    if (client.readyState === client.OPEN) client.send(payload);
+  }
+}
+
+const DASHBOARD_HTML = `<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>wx_dm 操控台</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 24px auto; padding: 0 16px; background: #f6f6f7; }
+  h1 { font-size: 18px; }
+  #status { font-size: 13px; color: #888; margin-bottom: 12px; }
+  #log { display: flex; flex-direction: column; gap: 6px; }
+  .row { padding: 8px 10px; border-radius: 6px; font-size: 14px; line-height: 1.4; }
+  .in { background: #e8f0fe; }
+  .out { background: #e6f4ea; }
+  .tag { font-weight: 600; margin-right: 6px; }
+  .ts { color: #999; font-size: 12px; margin-left: 8px; }
+</style>
+</head>
+<body>
+<h1>wx_dm 操控台(信鸽)</h1>
+<div id="status">连接中...</div>
+<div id="log"></div>
+<script>
+  const log = document.getElementById("log");
+  const status = document.getElementById("status");
+  function addRow(cls, tag, text, ts) {
+    const row = document.createElement("div");
+    row.className = "row " + cls;
+    const time = new Date(ts || Date.now()).toLocaleTimeString();
+    row.innerHTML = '<span class="tag">' + tag + '</span>' +
+      text.replace(/</g, "&lt;") + '<span class="ts">' + time + '</span>';
+    log.prepend(row);
+  }
+  function connect() {
+    const ws = new WebSocket("ws://" + location.host);
+    ws.onopen = () => status.textContent = "已连接";
+    ws.onclose = () => { status.textContent = "已断开，3秒后重连..."; setTimeout(connect, 3000); };
+    ws.onerror = () => ws.close();
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === "inbox") addRow("in", "收到", msg.text, msg.ts);
+      else if (msg.type === "outbox") addRow("out", "发送", msg.text, msg.ts);
+    };
+  }
+  connect();
+</script>
+</body>
+</html>`;
+
+function startControlServer(botToken, state) {
+  const server = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(DASHBOARD_HTML);
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  wss = new WebSocketServer({ server });
+
+  wss.on("connection", (ws) => {
+    ws.on("message", async (raw) => {
+      let entry;
+      try {
+        entry = JSON.parse(raw.toString());
+      } catch {
+        ws.send(JSON.stringify({ type: "error", message: "不是合法的JSON" }));
+        return;
+      }
+      if (!entry.reply_to || typeof entry.text !== "string") {
+        ws.send(JSON.stringify({ type: "error", message: "需要 {reply_to, text} 字段" }));
+        return;
+      }
+      const result = await sendReply(botToken, state, entry.reply_to, entry.text);
+      if (!result.ok) {
+        ws.send(JSON.stringify({ type: "error", message: result.error, reply_to: entry.reply_to }));
+        return;
+      }
+      // 存档进outbox.jsonl，并同步跳过行数，避免文件轮询那边重复处理这一条。
+      await appendFile(OUTBOX_FILE, JSON.stringify({ reply_to: entry.reply_to, text: entry.text }) + "\n", "utf-8");
+      state.outbox_lines_processed += 1;
+      await saveState(state);
+    });
+  });
+
+  // 只绑定127.0.0.1，跟inbox.jsonl/outbox.jsonl一样，默认信任"只有这台机器能碰"。
+  server.listen(WS_PORT, "127.0.0.1", () => {
+    console.log(`[控制台] 操控台已启动: http://127.0.0.1:${WS_PORT}`);
   });
 }
 
@@ -170,66 +294,105 @@ async function inboxLoop(botToken, state) {
       };
       await appendFile(INBOX_FILE, JSON.stringify(record) + "\n", "utf-8");
       console.log(`[inbox] 收到消息 -> ${id}: ${record.text}`);
+      broadcast({ type: "inbox", ...record });
     }
 
     await saveState(state);
   }
 }
 
-// ---------- 循环二：轮询 outbox.jsonl -> 发回微信 ----------
+// ---------- 发送逻辑（文件轮询和WebSocket客户端共用这一份） ----------
+
+async function sendReply(botToken, state, replyTo, text) {
+  const target = state.pending[replyTo];
+  if (!target) {
+    const error = `找不到 reply_to=${replyTo} 对应的会话（可能已处理过或id写错了）`;
+    console.error(`[outbox] ${error}`);
+    return { ok: false, error };
+  }
+
+  try {
+    await ilinkFetch("/ilink/bot/sendmessage", {
+      method: "POST",
+      token: botToken,
+      body: {
+        msg: {
+          to_user_id: target.to_user_id,
+          message_type: 2,
+          message_state: 2,
+          context_token: target.context_token,
+          item_list: [{ type: 1, text_item: { text } }],
+        },
+      },
+    });
+    console.log(`[outbox] 已发送回复 (reply_to=${replyTo})`);
+    delete state.pending[replyTo];
+    await saveState(state);
+    broadcast({ type: "outbox", reply_to: replyTo, text, ts: Date.now() });
+    return { ok: true };
+  } catch (e) {
+    console.error(`[outbox] 发送失败 (reply_to=${replyTo}):`, e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+// ---------- 循环二：监听 outbox.jsonl 变化 -> 发回微信 ----------
+//
+// 主要靠 fs.watch 在文件变化时立刻触发检查（低延迟），外加一个低频兜底轮询防止
+// fs.watch 在极少数环境下漏事件。两者最终都调用同一个 checkOutboxFile，
+// 靠 outbox_lines_processed 天然去重，不会重复发送。
 
 async function outboxLoop(botToken, state) {
-  console.log("[outbox] 开始监听 outbox.jsonl ...");
-  while (true) {
-    await new Promise((r) => setTimeout(r, OUTBOX_POLL_MS));
+  let checking = false;
 
-    if (!existsSync(OUTBOX_FILE)) continue;
-    const content = await readFile(OUTBOX_FILE, "utf-8");
-    const lines = content.split("\n").filter(Boolean);
+  async function checkOutboxFile() {
+    if (checking) return; // 避免同一时刻并发跑两次检查
+    checking = true;
+    try {
+      if (!existsSync(OUTBOX_FILE)) return;
+      const content = await readFile(OUTBOX_FILE, "utf-8");
+      const lines = content.split("\n").filter(Boolean);
+      if (lines.length <= state.outbox_lines_processed) return;
 
-    if (lines.length <= state.outbox_lines_processed) continue;
-
-    const newLines = lines.slice(state.outbox_lines_processed);
-    for (const line of newLines) {
-      let entry;
-      try {
-        entry = JSON.parse(line);
-      } catch {
-        console.error("[outbox] 跳过一行无法解析的内容:", line);
-        continue;
+      const newLines = lines.slice(state.outbox_lines_processed);
+      for (const line of newLines) {
+        let entry;
+        try {
+          entry = JSON.parse(line);
+        } catch {
+          console.error("[outbox] 跳过一行无法解析的内容:", line);
+          continue;
+        }
+        await sendReply(botToken, state, entry.reply_to, entry.text);
       }
 
-      const target = state.pending[entry.reply_to];
-      if (!target) {
-        console.error(
-          `[outbox] 找不到 reply_to=${entry.reply_to} 对应的会话，跳过（可能已处理过或id写错了）`
-        );
-        continue;
-      }
-
-      try {
-        await ilinkFetch("/ilink/bot/sendmessage", {
-          method: "POST",
-          token: botToken,
-          body: {
-            msg: {
-              to_user_id: target.to_user_id,
-              message_type: 2,
-              message_state: 2,
-              context_token: target.context_token,
-              item_list: [{ type: 1, text_item: { text: entry.text } }],
-            },
-          },
-        });
-        console.log(`[outbox] 已发送回复 (reply_to=${entry.reply_to})`);
-        delete state.pending[entry.reply_to];
-      } catch (e) {
-        console.error(`[outbox] 发送失败 (reply_to=${entry.reply_to}):`, e.message);
-      }
+      state.outbox_lines_processed = lines.length;
+      await saveState(state);
+    } finally {
+      checking = false;
     }
+  }
 
-    state.outbox_lines_processed = lines.length;
-    await saveState(state);
+  function armWatcher() {
+    if (!existsSync(OUTBOX_FILE)) {
+      // 文件还没创建（比如agent还没写过第一条回复），先兜底轮询等它出现。
+      setTimeout(armWatcher, OUTBOX_FALLBACK_POLL_MS);
+      return;
+    }
+    console.log("[outbox] fs.watch 已挂载在 outbox.jsonl 上，文件一变就会立刻检查");
+    const watcher = fsWatch(OUTBOX_FILE, () => checkOutboxFile());
+    watcher.on("error", (e) => {
+      console.error("[outbox] fs.watch出错，5秒后重挂:", e.message);
+      setTimeout(armWatcher, 5000);
+    });
+  }
+
+  console.log("[outbox] 开始监听 outbox.jsonl ...");
+  armWatcher();
+  // 兜底轮询：正常情况下 fs.watch 已经足够及时，这里只是双保险。
+  while (true) {
+    await new Promise((r) => setTimeout(r, OUTBOX_FALLBACK_POLL_MS));
+    await checkOutboxFile();
   }
 }
 
@@ -245,7 +408,9 @@ async function main() {
     await saveState(state);
   }
 
-  // 两个循环并行跑，互不阻塞
+  startControlServer(botToken, state);
+
+  // 几个循环并行跑，互不阻塞
   await Promise.all([inboxLoop(botToken, state), outboxLoop(botToken, state)]);
 }
 
