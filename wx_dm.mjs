@@ -72,6 +72,11 @@ async function ilinkFetch(pathAndQuery, { method = "GET", body, token } = {}) {
     "Content-Type": "application/json",
     AuthorizationType: "ilink_bot_token",
     "X-WECHAT-UIN": randomUin(),
+    // 这两个头之前一直没传——sendmessage在没有这两个头的情况下依然返回200+message_id，
+    // 但消息实际上不会送达（2026-09-18实测确认，接口本身不会告诉你这个区别，返回值长得
+    //一模一样）。照着官方iLink协议文档(nightsailer/wechat-clawbot的ilink-protocol.md)补上。
+    "iLink-App-Id": "bot",
+    "iLink-App-ClientVersion": "1",
   };
   if (token) headers.Authorization = `Bearer ${token}`;
 
@@ -361,11 +366,13 @@ async function sendReply(botToken, state, replyTo, text) {
       body: {
         msg: {
           to_user_id: target.to_user_id,
+          client_id: randomUUID(),
           message_type: 2,
           message_state: 2,
           context_token: target.context_token,
           item_list: [{ type: 1, text_item: { text } }],
         },
+        base_info: { channel_version: "2.1.1" },
       },
     });
     console.log(`[outbox] 已发送回复 (reply_to=${replyTo})`);
@@ -397,10 +404,12 @@ async function sendPush(botToken, state, sender, text) {
       body: {
         msg: {
           to_user_id: state.owner_user_id,
+          client_id: randomUUID(),
           message_type: 2,
           message_state: 2,
           item_list: [{ type: 1, text_item: { text: labeled } }],
         },
+        base_info: { channel_version: "2.1.1" },
       },
     });
     console.log(`[push] 已推送 (sender=${sender}): ${text}`);

@@ -141,6 +141,7 @@ node wx_dm.mjs
 - 没有做 `outbox.jsonl` / `inbox.jsonl` 的自动清理/轮转，长期跑文件会一直增长，需要的话自己定期归档。
 - 网络错误会自动重试(长轮询报错等 5 秒重试)，但不保证消息不丢——这是个人项目量级的实现，没做消息可靠性保证。
 - 微信 iLink 接口的响应格式偶尔会变(遇到过两次：二维码字段格式变化、长轮询成功响应不带 `ret` 字段)，如果脚本突然报错，先怀疑接口格式变了，抓一下原始响应看看。
+- **`sendmessage` 接口只有"受理确认"，没有"送达确认"**——返回 `200` + `message_id` 只代表微信服务器收到了这个发送请求，不代表消息真的到了对方手机上(实测过：请求缺 `client_id`/`base_info`/`iLink-App-Id`/`iLink-App-ClientVersion` 时，接口一样返回成功，但消息完全不会送达，两种情况的响应长得一模一样，没法从返回值区分)。这是协议本身的限制，`sendReply`/`sendPush` 返回 `{ok:true}` 只能代表"请求被接受"，没法代表"确认送达"，也没法做"失败自动重试"(重试的前提是能分辨失败)。详见 [`docs/adr/0003-sendmessage-required-fields.md`](docs/adr/0003-sendmessage-required-fields.md)。
 
 ## 免责声明 / Disclaimer
 
