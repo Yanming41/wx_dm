@@ -3,3 +3,4 @@ node_modules/
 qrcode.png
 inbox.jsonl
 outbox.jsonl
+*.log

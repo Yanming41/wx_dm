@@ -12,11 +12,17 @@
 //   2) WebSocket接口（ws://127.0.0.1:<WS_PORT>，仅本机可连）：
 //      本脚本收到微信消息 -> 立刻推送 {"type":"inbox",...} 给所有已连接客户端（同时也写inbox.jsonl）
 //      客户端发 {"reply_to":"...","text":"..."} -> 立刻发送回复（同时也补一行到outbox.jsonl存档）
+//      客户端发 {"sender":"...","text":"..."} -> 主动推送(不依赖任何一条inbox消息)
 //      支持同时连接多个客户端（不限制数量，由部署者自己决定开几个agent）
 //      浏览器打开 http://127.0.0.1:<WS_PORT> 可以看到一个只读操控台，显示收发消息
 //
 // inbox 一行格式：  {"id":"<uuid>","ts":<毫秒时间戳>,"from_user_id":"...","text":"..."}
-// outbox 一行格式： {"reply_to":"<inbox里的id>","text":"..."}
+// outbox 一行格式有两种，agent自己选：
+//   回复某条inbox消息： {"reply_to":"<inbox里的id>","text":"..."}
+//   主动推送(不回复谁)： {"sender":"<起个名字，比如"小红书爬虫">","text":"..."}
+//     主动推送会自动发给"owner_user_id"——也就是第一个给这个bot发过消息的微信账号
+//     (本脚本自己从第一条inbox消息里记下来的，不用手动配置)，文本会自动加上
+//     【<sender>来消息】的标签，方便主人一眼看出这是哪个程序发的。
 //   （agent只需要认识 id 和 text，不用管 to_user_id / context_token 这些微信协议细节，
 //    这些由本脚本内部维护的 pending 映射表负责补全。）
 //
@@ -90,9 +96,34 @@ async function ilinkFetch(pathAndQuery, { method = "GET", body, token } = {}) {
 
 async function loadState() {
   if (existsSync(STATE_FILE)) {
-    return JSON.parse(await readFile(STATE_FILE, "utf-8"));
+    const state = JSON.parse(await readFile(STATE_FILE, "utf-8"));
+    if (!state.owner_user_id) state.owner_user_id = await bootstrapOwnerId();
+    return state;
   }
-  return { bot_token: null, get_updates_buf: "", pending: {}, outbox_lines_processed: 0 };
+  return {
+    bot_token: null,
+    get_updates_buf: "",
+    pending: {},
+    outbox_lines_processed: 0,
+    owner_user_id: await bootstrapOwnerId(),
+  };
+}
+
+// owner_user_id：主动推送(不是回复某条inbox消息)时要发给谁，本脚本自己认不出"谁是主人"，
+// 只能从第一条真实收到的消息里"偷师"——这是个人单用户bot(见README已知限制：单进程单
+// bot_token，不支持多账号)，谁第一个发消息给这个bot，就默认谁是主人。
+// 如果inbox.jsonl还是空的(没人给bot发过消息)，先返回null，等真收到第一条消息时
+// inboxLoop会自己补上，不需要用户手动配置任何东西。
+async function bootstrapOwnerId() {
+  if (!existsSync(INBOX_FILE)) return null;
+  const content = await readFile(INBOX_FILE, "utf-8");
+  const firstLine = content.split("\n").find(Boolean);
+  if (!firstLine) return null;
+  try {
+    return JSON.parse(firstLine).from_user_id ?? null;
+  } catch {
+    return null;
+  }
 }
 
 async function saveState(state) {
@@ -166,7 +197,7 @@ const DASHBOARD_HTML = `<!doctype html>
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
       if (msg.type === "inbox") addRow("in", "收到", msg.text, msg.ts);
-      else if (msg.type === "outbox") addRow("out", "发送", msg.text, msg.ts);
+      else if (msg.type === "outbox") addRow("out", msg.sender ? "推送·" + msg.sender : "回复", msg.text, msg.ts);
     };
   }
   connect();
@@ -196,17 +227,24 @@ function startControlServer(botToken, state) {
         ws.send(JSON.stringify({ type: "error", message: "不是合法的JSON" }));
         return;
       }
-      if (!entry.reply_to || typeof entry.text !== "string") {
-        ws.send(JSON.stringify({ type: "error", message: "需要 {reply_to, text} 字段" }));
+      if (typeof entry.text !== "string" || (!entry.reply_to && !entry.sender)) {
+        ws.send(JSON.stringify({ type: "error", message: "需要 {reply_to, text} (回复) 或 {sender, text} (主动推送) 字段" }));
         return;
       }
-      const result = await sendReply(botToken, state, entry.reply_to, entry.text);
+
+      const result = entry.reply_to
+        ? await sendReply(botToken, state, entry.reply_to, entry.text)
+        : await sendPush(botToken, state, entry.sender, entry.text);
+
       if (!result.ok) {
         ws.send(JSON.stringify({ type: "error", message: result.error, reply_to: entry.reply_to }));
         return;
       }
       // 存档进outbox.jsonl，并同步跳过行数，避免文件轮询那边重复处理这一条。
-      await appendFile(OUTBOX_FILE, JSON.stringify({ reply_to: entry.reply_to, text: entry.text }) + "\n", "utf-8");
+      const archived = entry.reply_to
+        ? { reply_to: entry.reply_to, text: entry.text }
+        : { sender: entry.sender, text: entry.text };
+      await appendFile(OUTBOX_FILE, JSON.stringify(archived) + "\n", "utf-8");
       state.outbox_lines_processed += 1;
       await saveState(state);
     });
@@ -295,6 +333,11 @@ async function inboxLoop(botToken, state) {
       await appendFile(INBOX_FILE, JSON.stringify(record) + "\n", "utf-8");
       console.log(`[inbox] 收到消息 -> ${id}: ${record.text}`);
       broadcast({ type: "inbox", ...record });
+
+      if (!state.owner_user_id) {
+        state.owner_user_id = msg.from_user_id;
+        console.log(`[inbox] 记录主人身份(owner_user_id): ${msg.from_user_id}`);
+      }
     }
 
     await saveState(state);
@@ -336,6 +379,39 @@ async function sendReply(botToken, state, replyTo, text) {
   }
 }
 
+// sendPush：主动推送，不依赖任何inbox消息(没有reply_to/context_token)，直接发给
+// owner_user_id。文本前面自动加上 【<sender>来消息】 的标签，这样主人在微信里能一眼
+// 看出这条消息是哪个程序/agent发的，不用每次都去查是谁在说话。
+async function sendPush(botToken, state, sender, text) {
+  if (!state.owner_user_id) {
+    const error = "还没记录到owner_user_id——得先用微信给这个bot发一条消息，本脚本才知道该把主动推送发给谁";
+    console.error(`[push] ${error}`);
+    return { ok: false, error };
+  }
+
+  const labeled = `【${sender}来消息】\n${text}`;
+  try {
+    await ilinkFetch("/ilink/bot/sendmessage", {
+      method: "POST",
+      token: botToken,
+      body: {
+        msg: {
+          to_user_id: state.owner_user_id,
+          message_type: 2,
+          message_state: 2,
+          item_list: [{ type: 1, text_item: { text: labeled } }],
+        },
+      },
+    });
+    console.log(`[push] 已推送 (sender=${sender}): ${text}`);
+    broadcast({ type: "outbox", sender, text, ts: Date.now() });
+    return { ok: true };
+  } catch (e) {
+    console.error(`[push] 推送失败 (sender=${sender}):`, e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
 // ---------- 循环二：监听 outbox.jsonl 变化 -> 发回微信 ----------
 //
 // 主要靠 fs.watch 在文件变化时立刻触发检查（低延迟），外加一个低频兜底轮询防止
@@ -363,7 +439,13 @@ async function outboxLoop(botToken, state) {
           console.error("[outbox] 跳过一行无法解析的内容:", line);
           continue;
         }
-        await sendReply(botToken, state, entry.reply_to, entry.text);
+        if (entry.reply_to) {
+          await sendReply(botToken, state, entry.reply_to, entry.text);
+        } else if (entry.sender && typeof entry.text === "string") {
+          await sendPush(botToken, state, entry.sender, entry.text);
+        } else {
+          console.error("[outbox] 跳过一行格式不对的内容(缺 reply_to 或 sender+text):", line);
+        }
       }
 
       state.outbox_lines_processed = lines.length;
