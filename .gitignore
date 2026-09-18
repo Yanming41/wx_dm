@@ -1,0 +1,5 @@
+node_modules/
+.wechat_state.json
+qrcode.png
+inbox.jsonl
+outbox.jsonl

@@ -1,0 +1,13 @@
+{
+  "name": "wx_dm",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "微信ClawBot(iLink协议)纯传输层——收发消息 <-> inbox.jsonl/outbox.jsonl 文件收发箱，起草/agent逻辑由外部脚本对接，不含在本仓库内",
+  "main": "wx_dm.mjs",
+  "scripts": {
+    "start": "node wx_dm.mjs"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  }
+}
