@@ -142,6 +142,8 @@ node wx_dm.mjs
 - 网络错误会自动重试(长轮询报错等 5 秒重试)，但不保证消息不丢——这是个人项目量级的实现，没做消息可靠性保证。
 - 微信 iLink 接口的响应格式偶尔会变(遇到过两次：二维码字段格式变化、长轮询成功响应不带 `ret` 字段)，如果脚本突然报错，先怀疑接口格式变了，抓一下原始响应看看。
 - **`sendmessage` 接口只有"受理确认"，没有"送达确认"**——返回 `200` + `message_id` 只代表微信服务器收到了这个发送请求，不代表消息真的到了对方手机上(实测过：请求缺 `client_id`/`base_info`/`iLink-App-Id`/`iLink-App-ClientVersion` 时，接口一样返回成功，但消息完全不会送达，两种情况的响应长得一模一样，没法从返回值区分)。这是协议本身的限制，`sendReply`/`sendPush` 返回 `{ok:true}` 只能代表"请求被接受"，没法代表"确认送达"，也没法做"失败自动重试"(重试的前提是能分辨失败)。详见 [`docs/adr/0003-sendmessage-required-fields.md`](docs/adr/0003-sendmessage-required-fields.md)。
+- **发消息受"会话窗口"限制，不是想发就能发**——iLink 只有在用户最近主动给 bot 发过消息、"会话窗口"还开着的时候才会真正投递消息；这个窗口只能由用户发消息打开，bot 自己发消息不会延长/刷新它。窗口一关，不管 `sendReply` 还是 `sendPush`、带不带 `context_token`，一律返回 `{"ret":-2,"errmsg":"prepare failed"}`(容易误判成限流——**不是**限流，等更久没用，只有用户重新发一条消息才能重新打开窗口)。这意味着 wx_dm **不适合**"agent 主动发起、不依赖用户先说话"的场景(比如后台任务发现新东西就主动通知)，只适合"用户主动问、bot 立刻答"这类交互场景。详见 [`docs/adr/0004-wechat-clawbot-limitations-verdict.md`](docs/adr/0004-wechat-clawbot-limitations-verdict.md)。
+- **图片消息发不出去**——用 `item_list: [{type: 2, image_item: {url: "..."}}]` 发图片，即使字段补全、会话窗口确认开着，接口依然返回成功但图片不会送达。没找到任何文档说明图片消息的正确格式，`type: 2` 是根据 `type: 1`(文字)推测的，大概率是错的，也可能这个协议对个人号 ClawBot 根本没开放图片发送。目前 wx_dm 只能可靠地收发文字。
 
 ## 免责声明 / Disclaimer
 
